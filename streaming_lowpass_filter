@@ -1,0 +1,217 @@
+from functools import lru_cache
+from typing import Optional, Tuple
+
+import numpy as np
+import numpy.typing as npt
+import scipy.signal as sps  # type: ignore[import-untyped]
+from numpy_ringbuffer import RingBuffer
+
+# This class is not in use currently, but kept for reference and in case it is needed in the future. It could be useful.
+# Worth splitting this out into its own python package.
+class StreamingLowpassFilter:
+    def __init__(self, fs: float, fc: float, bw: float, dtype: npt.DTypeLike, freq_res: float = 0.1):
+        """
+        fs: Sampling frequency of the data source
+        fc: initial cutoff frequency
+        bw: initial width of the transition band as a fraction of fc. Default 0.1 (10%).
+        freq_res : Frequency resolution in Hz. Lowest frequency that can be affected by the filter.
+        """
+        self._fs = fs
+        self._taps = 1
+        self._filter = self._filter_cache(fc, bw, self._taps, fs)
+        self._fc = self._fs / 4
+        self._bw = 0.1
+        self._freq_res = freq_res
+        self._buffer = RingBuffer(1, dtype=float)
+        self._consecutive_datapoints = 0
+        self.set_dtype(dtype)
+        self.set_freq_res(freq_res)
+        self.set_cutoff(fc, bw)
+
+    @property
+    def frequency_response(self, worN: int = 512
+                           ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.complexfloating]]:
+        return sps.freqz(self._filter, worN=worN, fs=self._fs)  # type: ignore
+
+    @property
+    def fc(self) -> float:
+        return self._fc
+
+    def reset_buffer(self) -> None:
+        self._buffer.extend(np.zeros(shape=self._buffer._arr.shape, dtype=self._buffer.dtype))
+        self._consecutive_datapoints = 0
+
+    def set_cutoff(self, fc: float, bw: float) -> None:
+        """
+
+        Parameters
+        ----------
+        fc: Cutoff frequency
+        bw: Width of the transition band as a fraction of fc
+
+        Returns
+        -------
+
+        """
+        assert fc * (1 + bw) < self._fs / 2, "Cutoff frequency plus transition band (fc*(1+bw)) extends beyond " \
+                                             "nyquist freq."
+        assert fc > 0, "Cutoff frequency must be positive."
+        self._fc = fc
+        self._bw = bw
+        self._build_filter()
+
+    def set_freq_res(self, freq_res: float) -> None:
+        self._freq_res = freq_res
+        self._set_n_taps(int(np.round(self._fs / self._freq_res) // 2 * 2 + 1))
+        self._build_filter()
+
+    def _set_n_taps(self, taps: int) -> None:
+        self._taps = taps
+        old_buffer_data = self._buffer[:]
+        buffer_dtype = self._buffer.dtype
+        recreated_dtype = (buffer_dtype, self._buffer.shape[1]) if len(self._buffer.shape) == 2 else buffer_dtype
+        self._buffer = RingBuffer(taps - 1, dtype=recreated_dtype)
+        self.reset_buffer()
+        self._buffer.extend(old_buffer_data)
+        self._consecutive_datapoints = min(len(old_buffer_data), len(self._buffer))
+
+    def get_delay(self) -> float:
+        return ((len(self._filter) - 1) / 2) / self._fs
+
+    def set_dtype(self, dtype: npt.DTypeLike) -> None:
+        if isinstance(dtype, tuple):
+            actual_dtype = dtype[0]
+            new_sz = dtype[1] if len(dtype) == 2 else 1
+        else:
+            actual_dtype = dtype
+            new_sz = 1
+
+        old_sz = self._buffer.shape[1] if len(self._buffer.shape) == 2 else 1
+        if new_sz != old_sz or actual_dtype != self._buffer.dtype:
+            self._buffer = RingBuffer(self._taps - 1, dtype=dtype)
+            self.reset_buffer()  # We cannot keep any data since the dtype or dtype size has changed
+
+    def _build_filter(self) -> None:
+        fc = max(0.001, min(self._fc, self._fs / (2 * (1 + self._bw)) - 0.001))
+        self._filter = self._filter_cache(fc, self._bw, self._taps, self._fs)
+
+    @staticmethod
+    @lru_cache(4096)
+    def _filter_cache(fc: float, bw: float, taps: int, fs: float) -> npt.NDArray[np.floating]:
+        assert fc * (1 + bw) < fs / 2, "Cutoff frequency plus transition band (fc*(1+bw)) extends beyond nyquist freq."
+        return sps.firls(taps, (0, fc, fc * (1 + bw), fs / 2), (1, 1, 0, 0), fs=fs)  # type: ignore
+
+    def _build_filter_array(self, cutoff_vals: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+        def _f(fc: float) -> npt.NDArray[np.floating]:
+            self._fc = fc
+            self._build_filter()
+            return self._filter
+
+        return np.array([_f(fc) for fc in cutoff_vals])
+
+    def _convolve(self, data: np.ndarray, filter_array: np.ndarray, changes_idxs: np.ndarray
+                  ) -> npt.NDArray[np.floating]:
+        intervals = changes_idxs.shape[0]
+        filtered_data = np.empty(shape=len(data) - (self._taps - 1), dtype=data.dtype)
+        for n in range(intervals):
+            next_n = n + 1
+            filter = filter_array[n]
+            idx_start = changes_idxs[n]
+            idx_end = changes_idxs[next_n] + self._taps - 1 if next_n < intervals else len(data)
+            filtered_data[idx_start:idx_end - (self._taps - 1)] = np.convolve(data[idx_start:idx_end], filter,
+                                                                              mode='valid')
+        return filtered_data
+
+    def filter(self, data: npt.NDArray[np.floating], cutoff_array: Optional[npt.NDArray[np.floating]] = None
+               ) -> Tuple[npt.NDArray[np.floating], bool]:
+        shape = data.shape
+        n_datapoints = shape[0]
+        is_1d = len(shape) == 1
+        if not is_1d:
+            assert shape[1] == self._buffer.shape[1]
+        assert data.dtype == self._buffer.dtype, f"Dtype of data ({data.dtype}) does not match dtype of buffer " \
+                                                 f"({self._buffer.dtype})"
+
+        # Create arrays needed for variable cutoff frequency
+        changes_idxs = np.array([0])
+        if cutoff_array is not None:
+            assert len(cutoff_array) == n_datapoints, f"Cutoff array ({len(cutoff_array)}) must have the same length " \
+                                                      f"as axis 0 of data ({n_datapoints})."
+            changes_idxs = np.append(changes_idxs, np.where(np.diff(cutoff_array) != 0)[0] + 1)
+            cutoff_vals = cutoff_array[changes_idxs]
+        else:
+            cutoff_vals = np.array([self._fc])
+        filter_array = self._build_filter_array(cutoff_vals)
+
+        # Set up for filtering
+        convolve_shape = (n_datapoints + self._taps - 1,) if is_1d else (n_datapoints + self._taps - 1, data.shape[1])
+        data_to_convolve = np.zeros(shape=convolve_shape, dtype=data.dtype)
+        data_to_convolve[-n_datapoints:] = data
+        data_to_convolve[:-n_datapoints] = self._buffer[:]
+        if is_1d:
+            filtered = self._convolve(data_to_convolve, filter_array, changes_idxs)
+        else:
+            filtered = np.array([self._convolve(data_to_convolve[:, d], filter_array, changes_idxs) for d in
+                                 range(shape[1])]).transpose()
+        self._buffer.extend(data)
+        valid = self._consecutive_datapoints >= self._taps - 1
+        self._consecutive_datapoints += n_datapoints
+        return filtered, valid
+
+
+# This class is not in use currently, but kept for reference. It allows lowpass-filtering of streaming data, with
+# adjustable cutoff frequency set by the RPM.
+class RPMAdjustedStreamingLowpassFilter(StreamingLowpassFilter):
+    def __init__(self, fs: float, dtype: npt.DTypeLike, rpm_harmonic_fc: float = 12.5, fc_width: float = 0.5,
+                 qz: int = 10, min_rpm: float = 5, min_rpm_qz: float = 1) -> None:
+        super().__init__(fs, 1, fc_width / (rpm_harmonic_fc - fc_width / 2), dtype, min_rpm / 60)
+        self._rpm_harmonic_fc = rpm_harmonic_fc
+        self._fc_width = fc_width
+        self._min_rpm = min_rpm
+        self._min_rpm_qz = min_rpm_qz
+        self._qz = qz
+        self._quantized_rpm = self._create_quant_rpm_list()
+        self._prev_rpm_bin = np.array([1])
+
+    @property
+    def rpm_harmonic_fc(self) -> float:
+        return self._rpm_harmonic_fc
+
+    def set_rpm_harmonic_fc(self, rpm_harmonic_fc: float) -> None:
+        self._rpm_harmonic_fc = rpm_harmonic_fc
+
+    def _create_quant_rpm_list(self) -> npt.NDArray[np.floating]:
+        qz_ext = self._qz + 1
+        arr = np.power(2, np.arange(np.floor(np.log2(self._min_rpm) * qz_ext) / qz_ext,
+                                    np.floor(np.log2(self._fs * 60 / 2) * qz_ext) / qz_ext, 1 / qz_ext))
+        lt_min_rpm_qz = np.append(np.diff(arr) < self._min_rpm_qz, np.array([False]))
+        valid_arr = arr[~lt_min_rpm_qz]
+        min_rpm_qz_arr = np.flip(np.arange(valid_arr[0], arr[0], -self._min_rpm_qz)[1:])
+        arr = np.append(min_rpm_qz_arr, valid_arr)
+        return arr
+
+    def _quantize_rpm(self, rpm: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
+        digitized_rpm = np.clip(np.digitize(rpm, self._quantized_rpm), a_min=1, a_max=len(self._quantized_rpm) - 1)
+        difference = np.diff(np.append(self._prev_rpm_bin, digitized_rpm))
+        crossing_pos = np.where(difference > 0)[0]
+        crossing_neg = np.where(difference < 0)[0]
+        digitized_rpm_hyst = np.zeros(shape=rpm.shape[0] + 1, dtype=np.int32)
+        digitized_rpm_hyst[0] = self._prev_rpm_bin
+        digitized_rpm_hyst[crossing_neg + 1] = digitized_rpm[crossing_neg]
+        digitized_rpm_hyst[crossing_pos + 1] = digitized_rpm[crossing_pos] - 1
+        mask = digitized_rpm_hyst != 0
+        idx = np.where(mask, np.arange(mask.shape[0]), 0)
+        np.maximum.accumulate(idx, out=idx)
+        digitized_rpm_hyst = digitized_rpm_hyst[idx]
+        quantized_rpm: npt.NDArray[np.floating] = self._quantized_rpm[digitized_rpm_hyst][1:]
+        self._prev_rpm_bin = digitized_rpm_hyst[-1]
+        return quantized_rpm
+
+    def __call__(self, data: np.ndarray, rpm: np.ndarray) -> Tuple[npt.NDArray[np.floating], bool]:
+        quantized_f = self._quantize_rpm(rpm) / 60
+        fc = quantized_f * (self._rpm_harmonic_fc - self._fc_width / 2)
+        if len(fc) == 1:
+            self.set_cutoff(fc[0], self._bw)
+            return self.filter(data)
+        else:
+            return self.filter(data, fc)
